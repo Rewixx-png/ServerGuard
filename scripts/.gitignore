@@ -1,0 +1,24 @@
+# General
+__pycache__/
+*.py[cod]
+*$py.class
+.DS_Store
+
+# Environments
+.env
+venv/
+env/
+
+# Data & Logs
+*.log
+*.db
+*.sqlite
+data/
+server-guard/
+
+# IDE
+.idea/
+.vscode/
+
+# Docker
+docker-compose.override.yml
