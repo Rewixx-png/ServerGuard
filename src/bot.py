@@ -4,49 +4,58 @@ import sys
 import json
 import time
 import secrets
+import logging
 import aiosqlite
 import asyncssh
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command, StateFilter
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
+from aiogram.filters import Command
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
-# Config
+# --- Logging Setup ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("ServerGuard")
+
+# --- Configuration ---
 TOKEN = os.getenv("TG_TOKEN")
 ADMIN_ID = os.getenv("ADMIN_ID")
 PUBLIC_IP = os.getenv("PUBLIC_IP", "127.0.0.1")
 DB_PATH = "/data/guard.db"
-UDP_IP = "0.0.0.0"
 UDP_PORT = 9999
 HTTP_PORT = 8080
 
 if not TOKEN or not ADMIN_ID:
-    sys.exit("Fatal: TG_TOKEN or ADMIN_ID missing.")
+    logger.fatal("TG_TOKEN or ADMIN_ID is missing in environment variables.")
+    sys.exit(1)
 
 try:
     ADMIN_ID = int(ADMIN_ID)
 except ValueError:
-    sys.exit("Fatal: ADMIN_ID must be an integer.")
+    logger.fatal("ADMIN_ID must be an integer.")
+    sys.exit(1)
 
+# --- Bot Initialization ---
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
-# FSM States
+# --- FSM States ---
 class AddServer(StatesGroup):
     ip = State()
     port = State()
     user = State()
-    auth_method = State() # 'pass' or 'key'
+    auth_method = State()
     credentials = State()
 
+# --- Database Functions ---
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
+        # Servers Table
         await db.execute("""
             CREATE TABLE IF NOT EXISTS servers (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -56,12 +65,14 @@ async def init_db():
                 added_at INTEGER
             )
         """)
+        # Whitelist Table
         await db.execute("""
             CREATE TABLE IF NOT EXISTS approved_ips (
                 ip TEXT PRIMARY KEY,
                 expiry INTEGER
             )
         """)
+        # Logs Table
         await db.execute("""
             CREATE TABLE IF NOT EXISTS history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -72,10 +83,12 @@ async def init_db():
                 timestamp INTEGER
             )
         """)
-        # Default Localhost
+        
+        # Ensure Master Node exists
         async with db.execute("SELECT count(*) FROM servers") as cursor:
             count = await cursor.fetchone()
             if count[0] == 0:
+                logger.info("Initializing DB with Master Node...")
                 await db.execute(
                     "INSERT INTO servers (name, ip, token, added_at) VALUES (?, ?, ?, ?)",
                     ("Master Node", "127.0.0.1", "local-token", int(time.time()))
@@ -111,6 +124,7 @@ async def is_ip_allowed(ip: str) -> bool:
             if row and row[0] > now:
                 return True
             if row: 
+                # Cleanup expired
                 await db.execute("DELETE FROM approved_ips WHERE ip = ?", (ip,))
                 await db.commit()
     return False
@@ -125,30 +139,14 @@ async def approve_ip(ip: str, duration_hours: int = 1):
 async def deploy_agent(ip, port, user, password=None, key_file=None):
     token = await add_server_db(f"Agent {ip}", ip)
     
-    # We need to scp the scripts. In docker, they are in current dir or /app
-    # But usually Bot runs in /app and scripts are not there unless copied.
-    # We will reconstruct the installer content dynamically or assume availability.
-    # Best way: Read local files.
-    
-    # Check if files exist
-    base_path = "." # In Docker, WORKDIR is /app
+    # Files expected to be in /app/scripts inside Docker
+    # We map local names to remote /tmp names
     files_to_send = [
-        ("sg-check-access", "scripts/check_access.sh"),
-        ("sg-sftp-wrapper", "scripts/sftp_wrapper.sh"),
-        ("sg-logger", "scripts/logger.sh"),
-        ("agent_installer.sh", "scripts/agent_installer.sh")
+        ("scripts/check_access.sh", "sg-check-access"),
+        ("scripts/sftp_wrapper.sh", "sg-sftp-wrapper"),
+        ("scripts/logger.sh", "sg-logger"),
+        ("scripts/agent_installer.sh", "agent_installer.sh")
     ]
-    
-    # In docker, the context is /app. Scripts are not copied to /app/scripts in previous steps?
-    # Wait, 'installer.py' copies 'src' to install dir. Docker builds FROM src.
-    # But 'src' contains 'bot.py'. Does it contain 'scripts'?
-    # Previous user requests didn't explicitly COPY scripts into Docker image.
-    # CRITICAL FIX: We must assume scripts might be missing inside container if not COPY'd.
-    # But for now, let's assume valid mount or copy.
-    # If fails, we can just write content string.
-    
-    # Actually, let's look at Dockerfile previously generated. It only copies requirements and bot.py.
-    # FIX: We need to update Dockerfile to copy scripts too. I will update Dockerfile in this response.
     
     try:
         conn_args = {'host': ip, 'port': port, 'username': user, 'known_hosts': None}
@@ -159,72 +157,76 @@ async def deploy_agent(ip, port, user, password=None, key_file=None):
 
         async with asyncssh.connect(**conn_args) as conn:
             # Upload files
-            for remote_name, local_rel_path in files_to_send:
-                # local path is relative to /app inside docker
-                # We need to make sure these exist.
-                # If they don't, we are in trouble.
-                # Assuming updated Dockerfile.
-                await asyncssh.scp(local_rel_path, (conn, f"/tmp/{remote_name}"))
+            for local_rel, remote_name in files_to_send:
+                local_path = os.path.abspath(local_rel)
+                if not os.path.exists(local_path):
+                    return False, f"Missing local file: {local_path}"
+                
+                await asyncssh.scp(local_path, (conn, f"/tmp/{remote_name}"))
             
-            # Run Installer
+            # Run Installer on Remote
+            # Args: API_URL, TOKEN, LOG_HOST
             api_url = f"http://{PUBLIC_IP}:{HTTP_PORT}"
             log_host = PUBLIC_IP
             
             cmd = f"chmod +x /tmp/agent_installer.sh && /tmp/agent_installer.sh '{api_url}' '{token}' '{log_host}'"
             result = await conn.run(cmd, check=True)
+            
             return True, result.stdout
 
     except Exception as e:
+        logger.error(f"Deploy Error: {e}")
         return False, str(e)
 
-# --- Handlers ---
+# --- Telegram Handlers ---
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    if message.from_user.id != ADMIN_ID: return
+    if message.from_user.id != ADMIN_ID:
+        return
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Add Server", callback_data="add_server")],
-        [InlineKeyboardButton(text="📜 Access History", callback_data="menu_history")],
-        [InlineKeyboardButton(text="🔐 Whitelist IPs", callback_data="menu_whitelist")]
+        [InlineKeyboardButton(text="📜 History", callback_data="menu_history")],
+        [InlineKeyboardButton(text="🔐 Whitelist", callback_data="menu_whitelist")]
     ])
     
     await message.answer(
-        "🛡 <b>Server Guard Controller</b>\n\nSelect an action:",
+        f"🛡 <b>Server Guard Controller</b>\nIP: <code>{PUBLIC_IP}</code>\n\nSystem Online.",
         reply_markup=kb
     )
 
+# -- Add Server Flow --
 @dp.callback_query(F.data == "add_server")
 async def start_add_server(call: types.CallbackQuery, state: FSMContext):
-    await call.message.answer("🌐 Enter the <b>IP Address</b> of the new server:")
+    await call.message.answer("🌐 Enter <b>IP Address</b> of new server:")
     await state.set_state(AddServer.ip)
     await call.answer()
 
 @dp.message(AddServer.ip)
 async def process_ip(message: types.Message, state: FSMContext):
     await state.update_data(ip=message.text.strip())
-    await message.answer("🔌 Enter SSH Port (send 22 for default):")
+    await message.answer("🔌 Enter SSH Port (default 22):")
     await state.set_state(AddServer.port)
 
 @dp.message(AddServer.port)
 async def process_port(message: types.Message, state: FSMContext):
-    port = message.text.strip()
-    if not port.isdigit(): port = 22
-    await state.update_data(port=int(port))
-    await message.answer("👤 Enter SSH Username (send root for default):")
+    txt = message.text.strip()
+    port = int(txt) if txt.isdigit() else 22
+    await state.update_data(port=port)
+    await message.answer("👤 Enter SSH Username (default root):")
     await state.set_state(AddServer.user)
 
 @dp.message(AddServer.user)
 async def process_user(message: types.Message, state: FSMContext):
-    user = message.text.strip()
-    if not user: user = "root"
+    user = message.text.strip() or "root"
     await state.update_data(user=user)
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔑 Password", callback_data="auth_pass")],
-        [InlineKeyboardButton(text="📄 SSH Key File", callback_data="auth_key")]
+        [InlineKeyboardButton(text="📄 SSH Key", callback_data="auth_key")]
     ])
-    await message.answer("🔐 Choose authentication method:", reply_markup=kb)
+    await message.answer("🔐 Auth Method:", reply_markup=kb)
     await state.set_state(AddServer.auth_method)
 
 @dp.callback_query(AddServer.auth_method)
@@ -232,9 +234,9 @@ async def process_auth_method(call: types.CallbackQuery, state: FSMContext):
     method = call.data.split("_")[1]
     await state.update_data(auth_method=method)
     if method == "pass":
-        await call.message.answer("⌨️ Enter SSH Password:")
+        await call.message.answer("⌨️ Enter Password:")
     else:
-        await call.message.answer("📂 Send the SSH Private Key file:")
+        await call.message.answer("📂 Send Private Key File:")
     await state.set_state(AddServer.credentials)
     await call.answer()
 
@@ -246,34 +248,36 @@ async def process_credentials(message: types.Message, state: FSMContext):
     password = None
     key_file = None
     
-    msg = await message.answer(f"⏳ Connecting to {data['ip']}...")
+    status_msg = await message.answer(f"⏳ Connecting to {data['ip']}...")
     
     if auth_method == "pass":
         password = message.text
     else:
         if not message.document:
-            await message.answer("❌ Please send a file.")
+            await message.answer("❌ File expected.")
             return
         file_id = message.document.file_id
         file = await bot.get_file(file_id)
-        key_file = f"/tmp/key_{data['ip']}"
+        key_file = f"/tmp/key_{data['ip']}_{int(time.time())}"
         await bot.download_file(file.file_path, key_file)
         os.chmod(key_file, 0o600)
 
+    # Execute Deployment
     success, log = await deploy_agent(data['ip'], data['port'], data['user'], password, key_file)
     
     if key_file and os.path.exists(key_file):
         os.remove(key_file)
         
     if success:
-        await msg.edit_text(f"✅ <b>Agent Installed!</b>\nServer {data['ip']} is now protected.")
+        await status_msg.edit_text(f"✅ <b>Success!</b>\nServer {data['ip']} attached.")
     else:
-        # Truncate log if too long
-        log_snippet = (str(log)[:3000] + '..') if len(str(log)) > 3000 else str(log)
-        await msg.edit_text(f"❌ <b>Deployment Failed:</b>\n\n<code>{log_snippet}</code>")
+        # Truncate log
+        clean_log = str(log).replace("<", "&lt;")[:3000]
+        await status_msg.edit_text(f"❌ <b>Failed:</b>\n<pre>{clean_log}</pre>")
     
     await state.clear()
 
+# -- Menus --
 @dp.callback_query(F.data == "menu_history")
 async def show_history(call: types.CallbackQuery):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -286,15 +290,15 @@ async def show_history(call: types.CallbackQuery):
             rows = await cursor.fetchall()
             
     if not rows:
-        await call.message.edit_text("📜 History is empty.", reply_markup=None)
+        await call.message.edit_text("📜 History empty.", reply_markup=None)
         return
 
-    msg = "📜 <b>Last 10 Login Attempts:</b>\n\n"
+    msg = "📜 <b>Last Access Attempts:</b>\n"
     for r in rows:
         ts = time.strftime('%H:%M', time.localtime(r[3]))
         icon = "✅" if r[2] == "ALLOWED" else "⛔"
-        srv = r[4] if r[4] else "Unknown"
-        msg += f"{icon} <b>{srv}</b>\n   <code>{r[0]}</code> ({r[1]}) - {ts}\n"
+        srv = r[4] if r[4] else "?"
+        msg += f"{icon} <b>{srv}</b> | {r[1]}@{r[0]} ({ts})\n"
     
     await call.message.edit_text(msg, reply_markup=None)
 
@@ -305,77 +309,72 @@ async def show_whitelist(call: types.CallbackQuery):
         async with db.execute("SELECT ip, expiry FROM approved_ips WHERE expiry > ?", (now,)) as cursor:
             rows = await cursor.fetchall()
             
-    msg = "🔐 <b>Active Whitelisted IPs:</b>\n\n"
-    if not rows:
-        msg += "No active IPs."
-    
+    msg = "🔐 <b>Whitelisted IPs:</b>\n"
+    if not rows: msg += "None."
     for r in rows:
         left = int((r[1] - now) / 60)
-        msg += f"🌐 <code>{r[0]}</code> ({left} min left)\n"
-        
+        msg += f"🌐 <code>{r[0]}</code> ({left}m)\n"
+    
     await call.message.edit_text(msg, reply_markup=None)
 
-# --- HTTP API ---
+# --- HTTP API Handlers ---
+
 async def handle_check_access(request):
     token = request.headers.get("X-Guard-Token") or request.query.get("token")
     ip = request.query.get('ip')
     user = request.query.get('user')
     
     if not ip or not user:
-        return web.json_response({"status": "error"}, status=400)
+        return web.json_response({"status": "error", "msg": "missing_params"}, status=400)
     
-    # Authenticate Server
+    # 1. Authenticate Agent
     server = await get_server_by_token(token)
-    if not server:
-        # Fallback for localhost legacy or missing token
-        if ip == "127.0.0.1" or ip == "::1":
-            server = (1, "Master Node", "127.0.0.1")
-        else:
-            return web.json_response({"status": "unauthorized"}, status=401)
     
+    # FIX: Explicitly trust 'local-token' regardless of IP
+    # This handles cases where localhost resolves to public IP
+    if not server:
+        if token == "local-token":
+             server = (1, "Master Node", "127.0.0.1")
+        else:
+            logger.warning(f"Unauthorized API call from {ip} with token {token}")
+            return web.json_response({"status": "unauthorized"}, status=401)
+            
     server_id = server[0]
     server_name = server[1]
 
+    # 2. Check Permission
     allowed = await is_ip_allowed(ip)
     
+    # 3. Log
     status_log = "ALLOWED" if allowed else "BLOCKED"
     await log_attempt(server_id, ip, user, status_log)
     
     if allowed:
         return web.json_response({"status": "allowed"})
     
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"✅ Allow {ip} (1h)", callback_data=f"allow_{ip}")]
-    ])
-    
+    # 4. Notify Admin (Async)
     try:
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"✅ Allow {ip} (1h)", callback_data=f"allow_{ip}")]])
         await bot.send_message(
             chat_id=ADMIN_ID,
-            text=f"🚨 <b>UNAUTHORIZED ACCESS BLOCKED</b>\n\n"
-                 f"🏢 <b>Server:</b> {server_name}\n"
-                 f"👤 <b>User:</b> {user}\n"
-                 f"🌐 <b>IP:</b> <code>{ip}</code>\n"
-                 f"🕒 <b>Time:</b> {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-                 f"Connection closed.",
-            reply_markup=keyboard
+            text=f"🚨 <b>BLOCKED</b>\n\n🏢 <b>{server_name}</b>\n👤 {user}\n🌐 <code>{ip}</code>",
+            reply_markup=kb
         )
     except Exception as e:
-        print(f"Failed to send alert: {e}")
+        logger.error(f"Failed to send alert: {e}")
 
     return web.json_response({"status": "forbidden"}, status=403)
 
 @dp.callback_query(F.data.startswith("allow_"))
-async def process_callback_allow(callback_query: types.CallbackQuery):
-    ip = callback_query.data.split("_")[1]
+async def process_callback_allow(call: types.CallbackQuery):
+    ip = call.data.split("_")[1]
     await approve_ip(ip)
-    await bot.answer_callback_query(callback_query.id, text=f"IP {ip} allowed")
-    await bot.edit_message_text(
-        text=f"✅ <b>ACCESS GRANTED</b>\n\n🌐 <b>IP:</b> <code>{ip}</code>\n🔓 Authorized for 1 hour.",
-        chat_id=callback_query.message.chat.id,
-        message_id=callback_query.message.message_id
-    )
+    try:
+        await call.message.edit_text(f"✅ <b>Access Granted</b>\n🌐 {ip} (1h)")
+    except: pass
 
 # --- UDP Logger ---
+
 class UDPLogProtocol(asyncio.DatagramProtocol):
     def connection_made(self, transport):
         self.transport = transport
@@ -383,40 +382,42 @@ class UDPLogProtocol(asyncio.DatagramProtocol):
     def datagram_received(self, data, addr):
         try:
             payload = json.loads(data.decode())
-            asyncio.create_task(self.process_log(payload, addr))
+            # Debug log
+            logger.info(f"UDP Log from {addr}: {payload.get('cmd')}")
+            asyncio.create_task(self.process_log(payload))
         except Exception:
             pass
 
-    async def process_log(self, data, addr):
+    async def process_log(self, data):
         log_type = data.get("type", "info")
-        token = data.get("token", "")
-        
-        # Verify Token (Optional, but good practice)
-        # server = await get_server_by_token(token)
-        # For performance we might skip DB check on every UDP packet or cache it.
-        # Let's trust the token exists in DB for now or fallback to IP check.
-        
-        user = data.get("user", "unknown")
-        ip = data.get("ip", "unknown")
+        user = data.get("user", "?")
+        ip = data.get("ip", "?")
         cmd = data.get("cmd", "")
+        # Optional: Validate token here too if stricter security needed
 
-        if log_type == "cmd":
-            msg = (
-                f"💻 <b>CMD</b>: <code>{cmd}</code>\n"
-                f"👤 {user} | 🌐 {ip}"
-            )
+        if log_type == "cmd" and cmd:
+            msg = f"💻 <b>CMD</b>: <code>{cmd}</code>\n👤 {user} | 🌐 {ip}"
             try:
                 await bot.send_message(chat_id=ADMIN_ID, text=msg)
-            except Exception:
-                pass
+            except: pass
+
+# --- Main Setup ---
 
 async def start_background_tasks(app):
     loop = asyncio.get_running_loop()
+    # UDP Server
     transport, protocol = await loop.create_datagram_endpoint(
         lambda: UDPLogProtocol(),
-        local_addr=(UDP_IP, UDP_PORT)
+        local_addr=("0.0.0.0", UDP_PORT)
     )
     app['udp_transport'] = transport
+    
+    # Start Bot Polling
+    try:
+        await bot.send_message(ADMIN_ID, f"🟢 <b>System Online</b>\nRunning on Port {HTTP_PORT}")
+    except Exception as e:
+        logger.error(f"Startup Msg Failed: {e}")
+        
     asyncio.create_task(dp.start_polling(bot))
 
 async def cleanup_background_tasks(app):
@@ -435,7 +436,8 @@ async def main():
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', HTTP_PORT)
-    print(f"Starting Guard Controller on {HTTP_PORT}")
+    
+    print(f"ServerGuard Controller running on 0.0.0.0:{HTTP_PORT} (TCP) & {UDP_PORT} (UDP)")
     await site.start()
     
     await asyncio.Event().wait()
