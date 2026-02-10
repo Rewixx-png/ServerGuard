@@ -4,8 +4,9 @@ services:
     container_name: server_guard_bot
     restart: unless-stopped
     ports:
-      - "127.0.0.1:9999:9999/udp"
-      - "127.0.0.1:8080:8080/tcp"
+      # Bind to 0.0.0.0 to allow remote agents to connect
+      - "0.0.0.0:9999:9999/udp"
+      - "0.0.0.0:8080:8080/tcp"
     volumes:
       - ../data:/data
     env_file:

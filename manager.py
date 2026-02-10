@@ -5,7 +5,11 @@ import sqlite3
 import subprocess
 import time
 
+if sys.version_info[0] < 3:
+    raise Exception("Must be run using Python 3")
+
 INSTALL_DIR = "/opt/server-guard"
+CONFIG_DIR = "/etc/server-guard"
 DB_PATH = os.path.join(INSTALL_DIR, "data/guard.db")
 COMPOSE_FILE = os.path.join(INSTALL_DIR, "src/docker-compose.yml")
 
@@ -68,6 +72,9 @@ def uninstall():
     
     print("Removing files...")
     os.system(f"rm -rf {INSTALL_DIR}")
+    # CRITICAL: Also remove config to prevent 'None' token persistence
+    os.system(f"rm -rf {CONFIG_DIR}")
+    
     os.system("rm -f /usr/local/bin/sg-check-access")
     os.system("rm -f /usr/local/bin/sg-sftp-wrapper")
     os.system("rm -f /usr/local/bin/sg-logger")
@@ -77,23 +84,6 @@ def uninstall():
     print("Restoring SSH config (Manual check recommended)...")
     print("Please manually check /etc/ssh/sshd_config and remove 'Subsystem sftp /usr/local/bin/sg-sftp-wrapper'")
     
-    print("Cleaning bashrc...")
-    try:
-        with open(os.path.expanduser("~/.bashrc"), "r") as f:
-            lines = f.readlines()
-        with open(os.path.expanduser("~/.bashrc"), "w") as f:
-            skip = False
-            for line in lines:
-                if "# --- SERVERGUARD HOOK ---" in line:
-                    skip = True
-                if not skip:
-                    f.write(line)
-                if "# --- END SERVERGUARD ---" in line:
-                    skip = False
-    except:
-        pass
-
-    # Attempts to clean global bashrc as well
     try:
         target_rc = "/etc/bash.bashrc"
         with open(target_rc, "r") as f:
@@ -112,9 +102,7 @@ def uninstall():
         
     print("\n\033[1;32mUninstalled successfully.\033[0m")
     print("\n\033[1;33mIMPORTANT: Your current shell still has active hooks.\033[0m")
-    print("To stop error messages, please run this command immediately:")
-    print("\n    \033[1;37munset PROMPT_COMMAND\033[0m\n")
-    print("Or simply log out and log back in.")
+    print("Run: unset PROMPT_COMMAND")
     sys.exit(0)
 
 def main_menu():
