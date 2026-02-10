@@ -133,8 +133,10 @@ async def handle_check_access(request):
     ip = request.query.get('ip')
     user = request.query.get('user')
     
-    if not ip or not user:
-        return web.json_response({"status": "error"}, status=400)
+    if not ip:
+        return web.json_response({"status": "error", "message": "no_ip"}, status=400)
+    
+    if not user: user = "unknown"
 
     allowed = await is_ip_allowed(ip)
     
@@ -211,7 +213,8 @@ async def start_background_tasks(app):
     asyncio.create_task(dp.start_polling(bot))
 
 async def cleanup_background_tasks(app):
-    app['udp_transport'].close()
+    if 'udp_transport' in app:
+        app['udp_transport'].close()
     await bot.session.close()
 
 async def main():

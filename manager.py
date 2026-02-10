@@ -68,13 +68,16 @@ def uninstall():
     
     print("Removing files...")
     os.system(f"rm -rf {INSTALL_DIR}")
-    os.system("rm -f /usr/local/bin/sg-gatekeeper")
+    os.system("rm -f /usr/local/bin/sg-check-access")
+    os.system("rm -f /usr/local/bin/sg-sftp-wrapper")
     os.system("rm -f /usr/local/bin/sg-logger")
     os.system("rm -f /usr/local/bin/ToolsServer")
     os.system("rm -f /etc/profile.d/z99-server-guard.sh")
     
+    print("Restoring SSH config (Manual check recommended)...")
+    print("Please manually check /etc/ssh/sshd_config and remove 'Subsystem sftp /usr/local/bin/sg-sftp-wrapper'")
+    
     print("Cleaning bashrc...")
-    # Safe cleanup of bashrc hook
     try:
         with open(os.path.expanduser("~/.bashrc"), "r") as f:
             lines = f.readlines()
@@ -89,8 +92,29 @@ def uninstall():
                     skip = False
     except:
         pass
+
+    # Attempts to clean global bashrc as well
+    try:
+        target_rc = "/etc/bash.bashrc"
+        with open(target_rc, "r") as f:
+            lines = f.readlines()
+        with open(target_rc, "w") as f:
+            skip = False
+            for line in lines:
+                if "# --- SERVERGUARD HOOK ---" in line:
+                    skip = True
+                if not skip:
+                    f.write(line)
+                if "# --- END SERVERGUARD ---" in line:
+                    skip = False
+    except:
+        pass
         
-    print("Uninstalled successfully.")
+    print("\n\033[1;32mUninstalled successfully.\033[0m")
+    print("\n\033[1;33mIMPORTANT: Your current shell still has active hooks.\033[0m")
+    print("To stop error messages, please run this command immediately:")
+    print("\n    \033[1;37munset PROMPT_COMMAND\033[0m\n")
+    print("Or simply log out and log back in.")
     sys.exit(0)
 
 def main_menu():
